@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import sys
+import threading
 from typing import Optional
 from dotenv import load_dotenv
 
@@ -182,10 +183,23 @@ class SecureChatClient:
             encrypted_salt_bytes = b64d(salt_response.get("data", ""))
             decrypted_salt_bytes = decrypt_aes_128_ecb(encrypted_salt_bytes, self.temp_aes_key)
             salt_data = json.loads(decrypted_salt_bytes.decode('utf-8'))
+            
+            # Check if server sent an error
+            if salt_data.get("type") == "error":
+                print(f"[!] {salt_data.get('message', 'User not found')}")
+                return False
+            
+            # Extract salt
             salt_b64 = salt_data.get("salt", "")
+            if not salt_b64:
+                print("[!] No salt in server response")
+                return False
+            
             salt = b64d(salt_b64)
         except Exception as e:
             print(f"[!] Failed to decrypt salt: {e}")
+            import traceback
+            traceback.print_exc()
             return False
         
         # Compute password hash
@@ -283,9 +297,73 @@ class SecureChatClient:
             server_fp
         )
     
+    def receive_messages(self):
+        """Receive and display messages from server."""
+        while True:
+            try:
+                # Receive message
+                msg_data = self.recv_json()
+                
+                # Check for error messages
+                if msg_data.get("type") == "error":
+                    error_msg = msg_data.get("message", "Unknown error")
+                    if error_msg in ["REPLAY", "SIG_FAIL", "DECRYPT_FAIL"]:
+                        print(f"[!] Server error: {error_msg}")
+                    continue
+                
+                # Parse chat message
+                try:
+                    chat_msg = parse_message(msg_data)
+                    if not isinstance(chat_msg, ChatMessage):
+                        continue
+                    
+                    # Verify signature
+                    server_pub_key = load_public_key_from_pem(self.server_cert_pem)
+                    hash_input = f"{chat_msg.seqno}{chat_msg.ts}{chat_msg.ct}".encode('utf-8')
+                    hash_bytes = sha256_hex(hash_input).encode('utf-8')
+                    
+                    if not verify_signature_base64(hash_bytes, chat_msg.sig, server_pub_key):
+                        print("[!] Signature verification failed for server message")
+                        continue
+                    
+                    # Decrypt message
+                    ciphertext_bytes = b64d(chat_msg.ct)
+                    plaintext_bytes = decrypt_aes_128_ecb(ciphertext_bytes, self.session_aes_key)
+                    plaintext = plaintext_bytes.decode('utf-8')
+                    
+                    # Append to transcript
+                    server_fp = get_cert_fp(self.server_cert_pem)
+                    append_to_transcript(
+                        self.transcript_path,
+                        chat_msg.seqno,
+                        chat_msg.ts,
+                        chat_msg.ct,
+                        chat_msg.sig,
+                        server_fp
+                    )
+                    
+                    # Display message
+                    print(f"\n[Server] {plaintext}")
+                    print("You: ", end="", flush=True)
+                    
+                except Exception as e:
+                    print(f"[!] Error processing message: {e}")
+                    continue
+                    
+            except ConnectionError:
+                print("\n[*] Server disconnected")
+                break
+            except Exception as e:
+                print(f"\n[!] Receive error: {e}")
+                break
+    
     def chat_loop(self):
-        """Main chat loop."""
+        """Main chat loop with bidirectional communication."""
         print("[+] Chat session started. Type messages (or 'quit' to end)")
+        
+        # Start receiver thread
+        receiver_thread = threading.Thread(target=self.receive_messages, daemon=True)
+        receiver_thread.start()
         
         while True:
             try:
@@ -301,15 +379,73 @@ class SecureChatClient:
                 # Send message
                 self.send_message(message)
                 
-                # Try to receive response (non-blocking check)
-                # For simplicity, we'll make it blocking for now
-                # In a real implementation, you'd use threading or select
-                
             except KeyboardInterrupt:
+                print("\n[*] Ending chat session...")
                 break
             except Exception as e:
                 print(f"[!] Error: {e}")
                 break
+        
+        # Generate and receive session receipt
+        self.handle_session_receipt()
+    
+    def handle_session_receipt(self):
+        """Generate and exchange session receipt."""
+        if not self.transcript_path or not os.path.exists(self.transcript_path):
+            return
+        
+        try:
+            # Compute transcript hash
+            transcript_hash = compute_transcript_hash(self.transcript_path)
+            
+            # Read transcript to get first and last seqno
+            from app.storage.transcript import read_transcript
+            entries = read_transcript(self.transcript_path)
+            
+            if not entries:
+                return
+            
+            first_seq = entries[0]["seqno"]
+            last_seq = entries[-1]["seqno"]
+            
+            # Sign transcript hash
+            hash_bytes = transcript_hash.encode('utf-8')
+            receipt_sig = sign_data_base64(hash_bytes, self.client_key)
+            
+            # Create session receipt
+            receipt = SessionReceipt(
+                peer="client",
+                first_seq=first_seq,
+                last_seq=last_seq,
+                transcript_sha256=transcript_hash,
+                sig=receipt_sig
+            )
+            
+            # Send receipt to server
+            self.send_json(receipt.model_dump())
+            
+            # Save receipt to file
+            receipt_path = self.transcript_path.replace(".txt", "_receipt.json")
+            with open(receipt_path, "w") as f:
+                f.write(json.dumps(receipt.model_dump(), indent=2))
+            
+            print(f"[+] Session receipt generated: {receipt_path}")
+            
+            # Try to receive server receipt
+            try:
+                server_receipt_data = self.recv_json()
+                if server_receipt_data.get("type") == "receipt":
+                    server_receipt_path = receipt_path.replace("client", "server_received")
+                    with open(server_receipt_path, "w") as f:
+                        f.write(json.dumps(server_receipt_data, indent=2))
+                    print(f"[+] Server receipt received: {server_receipt_path}")
+            except:
+                pass  # Server might have disconnected
+                
+        except Exception as e:
+            print(f"[!] Error generating receipt: {e}")
+            import traceback
+            traceback.print_exc()
     
     def run(self):
         """Run the client."""

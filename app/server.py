@@ -219,20 +219,52 @@ class SecureChatServer:
         """Handle user registration."""
         try:
             reg_msg = RegisterMessage(**reg_data)
-            success, message = register_user(reg_msg.email, reg_msg.username, reg_msg.pwd)
             
-            if success:
-                # Set authenticated username for registration
-                self.authenticated_username = reg_msg.username
-                self.send_json(sock, {"type": "register_success", "message": message})
-                print(f"[+] User registered: {reg_msg.username}")
-                return "registered"
-            else:
-                self.send_json(sock, {"type": "register_fail", "message": message})
-                print(f"[!] Registration failed: {message}")
+            # Client sends: pwd (base64-encoded hex hash) and salt (base64-encoded)
+            # Decode them
+            pwd_hash_b64 = reg_msg.pwd
+            salt_b64 = reg_msg.salt
+            
+            # Decode from base64
+            pwd_hash_hex = b64d(pwd_hash_b64).decode('utf-8')  # Hex string
+            salt = b64d(salt_b64)  # Bytes
+            
+            # Check if username already exists
+            from app.storage.db import user_exists_by_username, user_exists_by_email, get_db_connection
+            if user_exists_by_username(reg_msg.username):
+                self.send_json(sock, {"type": "register_fail", "message": "Username already exists"})
                 return None
+            
+            if user_exists_by_email(reg_msg.email):
+                self.send_json(sock, {"type": "register_fail", "message": "Email already registered"})
+                return None
+            
+            # Store in database
+            connection = get_db_connection()
+            try:
+                with connection.cursor() as cursor:
+                    sql = """
+                    INSERT INTO users (email, username, salt, pwd_hash)
+                    VALUES (%s, %s, %s, %s)
+                    """
+                    cursor.execute(sql, (reg_msg.email, reg_msg.username, salt, pwd_hash_hex))
+                    connection.commit()
+                    
+                    # Set authenticated username for registration
+                    self.authenticated_username = reg_msg.username
+                    self.send_json(sock, {"type": "register_success", "message": "User registered successfully"})
+                    print(f"[+] User registered: {reg_msg.username}")
+                    return "registered"
+            except Exception as db_error:
+                connection.rollback()
+                self.send_json(sock, {"type": "register_fail", "message": f"Database error: {str(db_error)}"})
+                return None
+            finally:
+                connection.close()
         except Exception as e:
             print(f"[!] Registration error: {e}")
+            import traceback
+            traceback.print_exc()
             self.send_json(sock, {"type": "error", "message": str(e)})
             return None
     
@@ -241,27 +273,49 @@ class SecureChatServer:
         try:
             login_msg = LoginMessage(**login_data)
             
-            # Get user salt for password verification
-            salt = get_user_salt(login_msg.email)
-            if not salt:
-                self.send_json(sock, {"type": "login_fail", "message": "Invalid email or password"})
-                return None
-            
-            # Authenticate user
-            success, username, _, error = authenticate_user(login_msg.email, login_msg.pwd)
-            
-            if success and username:
-                # Dual gate: certificate already validated, password verified
-                self.authenticated_username = username
-                self.send_json(sock, {"type": "login_success", "message": "Login successful", "username": username})
-                print(f"[+] User logged in: {username}")
-                return "logged_in"
-            else:
-                self.send_json(sock, {"type": "login_fail", "message": error or "Invalid email or password"})
-                print(f"[!] Login failed: {error}")
-                return None
+            # Get user salt and stored hash from database
+            from app.storage.db import get_db_connection
+            connection = get_db_connection()
+            try:
+                with connection.cursor() as cursor:
+                    sql = "SELECT username, salt, pwd_hash FROM users WHERE email = %s"
+                    cursor.execute(sql, (login_msg.email,))
+                    result = cursor.fetchone()
+                    
+                    if not result:
+                        self.send_json(sock, {"type": "login_fail", "message": "Invalid email or password"})
+                        return None
+                    
+                    username = result['username']
+                    salt = result['salt']
+                    stored_hash = result['pwd_hash']
+                    
+                    # Decode the client's password hash (base64 -> hex string)
+                    client_hash_b64 = login_msg.pwd
+                    client_hash_hex = b64d(client_hash_b64).decode('utf-8')
+                    
+                    # Compare hashes (constant-time)
+                    from app.storage.db import verify_password
+                    # We need to reconstruct the password hash to verify
+                    # Actually, we can't verify without the password. The client sent the hash.
+                    # We need to compare the hash directly
+                    import secrets
+                    if secrets.compare_digest(client_hash_hex, stored_hash):
+                        # Dual gate: certificate already validated, password verified
+                        self.authenticated_username = username
+                        self.send_json(sock, {"type": "login_success", "message": "Login successful", "username": username})
+                        print(f"[+] User logged in: {username}")
+                        return "logged_in"
+                    else:
+                        self.send_json(sock, {"type": "login_fail", "message": "Invalid email or password"})
+                        print(f"[!] Login failed: Password hash mismatch")
+                        return None
+            finally:
+                connection.close()
         except Exception as e:
             print(f"[!] Login error: {e}")
+            import traceback
+            traceback.print_exc()
             self.send_json(sock, {"type": "error", "message": str(e)})
             return None
     
@@ -361,10 +415,66 @@ class SecureChatServer:
                 break
             except ConnectionError:
                 print("[*] Client disconnected")
+                self.generate_session_receipt(sock)
+                break
+            except KeyboardInterrupt:
+                print("\n[*] Chat session ending...")
+                self.generate_session_receipt(sock)
                 break
             except Exception as e:
                 print(f"[!] Error: {e}")
                 break
+        
+        # Generate receipt when chat ends
+        self.generate_session_receipt(sock)
+    
+    def generate_session_receipt(self, sock: socket.socket):
+        """Generate and send session receipt for non-repudiation."""
+        if not self.transcript_path or not os.path.exists(self.transcript_path):
+            return
+        
+        try:
+            # Compute transcript hash
+            transcript_hash = compute_transcript_hash(self.transcript_path)
+            
+            # Read transcript to get first and last seqno
+            from app.storage.transcript import read_transcript
+            entries = read_transcript(self.transcript_path)
+            
+            if not entries:
+                return
+            
+            first_seq = entries[0]["seqno"]
+            last_seq = entries[-1]["seqno"]
+            
+            # Sign transcript hash
+            hash_bytes = transcript_hash.encode('utf-8')
+            receipt_sig = sign_data_base64(hash_bytes, self.server_key)
+            
+            # Create session receipt
+            from app.common.protocol import SessionReceipt
+            receipt = SessionReceipt(
+                peer="server",
+                first_seq=first_seq,
+                last_seq=last_seq,
+                transcript_sha256=transcript_hash,
+                sig=receipt_sig
+            )
+            
+            # Send receipt to client
+            self.send_json(sock, receipt.model_dump())
+            
+            # Save receipt to file
+            receipt_path = self.transcript_path.replace(".txt", "_receipt.json")
+            with open(receipt_path, "w") as f:
+                f.write(json.dumps(receipt.model_dump(), indent=2))
+            
+            print(f"[+] Session receipt generated: {receipt_path}")
+            
+        except Exception as e:
+            print(f"[!] Error generating receipt: {e}")
+            import traceback
+            traceback.print_exc()
     
     def start(self):
         """Start the server."""
