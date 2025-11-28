@@ -119,14 +119,25 @@ def check_certificate_validity(cert: x509.Certificate) -> bool:
     Returns:
         True if certificate is valid (not expired, not before valid date), False otherwise
     """
-    now = datetime.utcnow()
+    from datetime import timezone
+    now = datetime.now(timezone.utc)
+    
+    # Convert certificate dates to timezone-aware if needed
+    not_before = cert.not_valid_before_utc
+    not_after = cert.not_valid_after_utc
+    
+    # If certificate dates are naive, make them timezone-aware (UTC)
+    if not_before.tzinfo is None:
+        not_before = not_before.replace(tzinfo=timezone.utc)
+    if not_after.tzinfo is None:
+        not_after = not_after.replace(tzinfo=timezone.utc)
     
     # Check if certificate is not yet valid
-    if now < cert.not_valid_before_utc:
+    if now < not_before:
         return False
     
     # Check if certificate has expired
-    if now > cert.not_valid_after_utc:
+    if now > not_after:
         return False
     
     return True
@@ -241,11 +252,21 @@ def validate_certificate(
     
     # Check 3: Validity period (not expired, not before valid date)
     if not check_certificate_validity(cert):
-        now = datetime.utcnow()
-        if now < cert.not_valid_before_utc:
-            return False, f"BAD_CERT: Certificate not yet valid (valid from {cert.not_valid_before_utc})"
-        if now > cert.not_valid_after_utc:
-            return False, f"BAD_CERT: Certificate expired (expired on {cert.not_valid_after_utc})"
+        from datetime import timezone
+        now = datetime.now(timezone.utc)
+        
+        # Convert certificate dates to timezone-aware if needed
+        not_before = cert.not_valid_before_utc
+        not_after = cert.not_valid_after_utc
+        if not_before.tzinfo is None:
+            not_before = not_before.replace(tzinfo=timezone.utc)
+        if not_after.tzinfo is None:
+            not_after = not_after.replace(tzinfo=timezone.utc)
+        
+        if now < not_before:
+            return False, f"BAD_CERT: Certificate not yet valid (valid from {not_before})"
+        if now > not_after:
+            return False, f"BAD_CERT: Certificate expired (expired on {not_after})"
         return False, "BAD_CERT: Certificate validity check failed"
     
     # Check 4: Hostname match (if expected_hostname is provided and strict_hostname is True)
