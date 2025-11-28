@@ -1,0 +1,88 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# Certificates and Private Keys (NEVER COMMIT THESE!)
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+*.jks
+certs/*.pem
+certs/*.key
+certs/*.crt
+certs/ca*
+certs/server*
+certs/client*
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs and transcripts (may contain sensitive data)
+*.log
+logs/
+transcripts/*.txt
+transcripts/*.json
+receipts/*.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Wireshark captures (may contain sensitive data)
+*.pcap
+*.pcapng
+*.cap
+
+# OS
+Thumbs.db
+.DS_Store
+
+# MySQL dumps (if they contain real data)
+*.sql
+!schema.sql
+!sample_data.sql
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
