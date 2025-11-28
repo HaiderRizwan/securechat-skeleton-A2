@@ -8,7 +8,7 @@ from pathlib import Path
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography import x509
-from cryptography.x509.oid import NameOID, BasicConstraints
+from cryptography.x509.oid import NameOID
 
 
 def generate_ca(name: str, output_dir: str = "certs"):
